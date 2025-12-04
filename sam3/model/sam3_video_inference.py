@@ -22,8 +22,33 @@ from sam3.perflib.compile import compile_wrapper, shape_logging_wrapper
 from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
 from torchvision.ops import masks_to_boxes
 from tqdm.auto import tqdm
+from functools import wraps
 
 logger = get_logger(__name__)
+
+
+def _get_autocast_dtype():
+    """Get appropriate autocast dtype based on GPU capability."""
+    if not torch.cuda.is_available():
+        return None
+    major, _ = torch.cuda.get_device_capability()
+    if major >= 8:  # Ampere+ supports bf16
+        return torch.bfloat16
+    elif major >= 7:  # Volta/Turing use fp16
+        return torch.float16
+    return None
+
+
+def autocast_if_cuda(func):
+    """Decorator that applies autocast with appropriate dtype based on GPU capability."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        dtype = _get_autocast_dtype()
+        if dtype is not None:
+            with torch.autocast(device_type="cuda", dtype=dtype):
+                return func(*args, **kwargs)
+        return func(*args, **kwargs)
+    return wrapper
 
 
 class Sam3VideoInference(Sam3VideoBase):
@@ -59,10 +84,14 @@ class Sam3VideoInference(Sam3VideoBase):
         video_loader_type="cv2",
     ):
         """Initialize an inference state from `resource_path` (an image or a video)."""
+        # Get actual current device from model parameters
+        device = next(self.parameters()).device
+
         images, orig_height, orig_width = load_resource_as_video_frames(
             resource_path=resource_path,
             image_size=self.image_size,
             offload_video_to_cpu=offload_video_to_cpu,
+            device=device,
             img_mean=self.image_mean,
             img_std=self.image_std,
             async_loading_frames=async_loading_frames,
@@ -114,7 +143,8 @@ class Sam3VideoInference(Sam3VideoBase):
         """Construct an initial `BatchedDatapoint` instance as input."""
         # 1) img_batch
         num_frames = len(images)
-        device = self.device
+        # Get actual current device from model parameters (handles dynamic device changes)
+        device = next(self.parameters()).device
 
         # 2) find_text_batch
         # "<text placeholder>" will be replaced by the actual text prompt when adding prompts
@@ -147,7 +177,7 @@ class Sam3VideoInference(Sam3VideoBase):
             find_targets=[None] * num_frames,
             find_metadatas=[None] * num_frames,
         )
-        input_batch = copy_data_to_device(input_batch, device, non_blocking=True)
+        input_batch = copy_data_to_device(input_batch, device, non_blocking=torch.cuda.is_available())
         inference_state["input_batch"] = input_batch
 
         # construct the placeholder interactive prompts and tracking queries
@@ -477,9 +507,14 @@ class Sam3VideoInference(Sam3VideoBase):
 
             # slice those valid entries from the original outputs
             keep_idx = torch.nonzero(keep, as_tuple=True)[0]
-            keep_idx_gpu = keep_idx.pin_memory().to(
-                device=out_binary_masks.device, non_blocking=True
-            )
+
+            # Only pin_memory if CUDA is available
+            if torch.cuda.is_available():
+                keep_idx_gpu = keep_idx.pin_memory().to(
+                    device=out_binary_masks.device, non_blocking=True
+                )
+            else:
+                keep_idx_gpu = keep_idx.to(device=out_binary_masks.device)
 
             out_obj_ids = torch.index_select(out_obj_ids, 0, keep_idx)
             out_probs = torch.index_select(out_probs, 0, keep_idx)
@@ -512,7 +547,7 @@ class Sam3VideoInference(Sam3VideoBase):
             ) > 0
 
         outputs = {
-            "out_obj_ids": out_obj_ids.cpu().numpy(),
+            "obj_ids": out_obj_ids.cpu().numpy(),
             "out_probs": out_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
@@ -795,7 +830,7 @@ class Sam3VideoInference(Sam3VideoBase):
         return inference_state
 
     @torch.inference_mode()
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @autocast_if_cuda
     def warm_up_compilation(self):
         """
         Warm up the model by running a dummy inference to compile the model. This is
@@ -903,7 +938,7 @@ class Sam3VideoInference(Sam3VideoBase):
         )
         return frame_idx, self._postprocess_output(inference_state, out)
 
-    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    @autocast_if_cuda
     def forward(self, input: BatchedDatapoint, is_inference: bool = False):
         """This method is only used for benchmark eval (not used in the demo)."""
         # set the model to single GPU for benchmark evaluation (to be compatible with trainer)
@@ -1153,6 +1188,12 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                             )
                         )  # (1, H_video, W_video) bool
                         refined_obj_id_to_mask[obj_id] = refined_mask_video_res
+
+                    # Initialize cache if not present (needed for point prompts during propagation)
+                    if "cached_frame_outputs" not in inference_state:
+                        inference_state["cached_frame_outputs"] = {}
+                    if frame_idx not in inference_state["cached_frame_outputs"]:
+                        inference_state["cached_frame_outputs"][frame_idx] = {}
 
                     obj_id_to_mask = self._build_tracker_output(
                         inference_state, frame_idx, refined_obj_id_to_mask
@@ -1575,6 +1616,12 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             new_mask_data = data_list[0].to(self.device)
 
         if self.rank == 0:
+            # Initialize cache if not present (needed for point prompts without prior propagation)
+            if "cached_frame_outputs" not in inference_state:
+                inference_state["cached_frame_outputs"] = {}
+            if frame_idx not in inference_state["cached_frame_outputs"]:
+                inference_state["cached_frame_outputs"][frame_idx] = {}
+
             obj_id_to_mask = self._build_tracker_output(
                 inference_state,
                 frame_idx,

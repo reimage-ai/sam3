@@ -308,19 +308,8 @@ def _create_sam3_model(
         "inst_interactive_predictor": inst_interactive_predictor,
     }
 
+    # Matcher is only needed for training, always None for inference-only mode
     matcher = None
-    if not eval_mode:
-        from sam3.train.matcher import BinaryHungarianMatcherV2
-
-        matcher = BinaryHungarianMatcherV2(
-            focal=True,
-            cost_class=2.0,
-            cost_bbox=5.0,
-            cost_giou=2.0,
-            alpha=0.25,
-            gamma=2,
-            stable=False,
-        )
     common_params["matcher"] = matcher
     model = Sam3Image(**common_params)
 
@@ -537,18 +526,37 @@ def _load_checkpoint(model, checkpoint_path):
                 if "tracker" in k
             }
         )
-    missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
+    # Debug: show what we're loading
+    inst_keys = [k for k in sam3_image_ckpt.keys() if 'inst_interactive_predictor' in k]
+    print(f"[SAM3] Loading checkpoint with {len(sam3_image_ckpt)} keys ({len(inst_keys)} for inst_interactive_predictor)")
+
+    missing_keys, unexpected_keys = model.load_state_dict(sam3_image_ckpt, strict=False)
+
+    # Check for missing inst_interactive_predictor keys
+    critical_missing = [k for k in missing_keys if 'inst_interactive_predictor' in k]
+    if critical_missing:
+        print(f"[SAM3] WARNING: Missing inst_interactive_predictor keys: {len(critical_missing)}")
+        for k in critical_missing[:10]:
+            print(f"[SAM3]   MISSING: {k}")
+
+    # Check for unexpected keys
+    if unexpected_keys:
+        inst_unexpected = [k for k in unexpected_keys if 'inst_interactive_predictor' in k]
+        if inst_unexpected:
+            print(f"[SAM3] WARNING: Unexpected inst_interactive_predictor keys: {len(inst_unexpected)}")
+            for k in inst_unexpected[:5]:
+                print(f"[SAM3]   UNEXPECTED: {k}")
+
     if len(missing_keys) > 0:
-        print(
-            f"loaded {checkpoint_path} and found "
-            f"missing and/or unexpected keys:\n{missing_keys=}"
-        )
+        print(f"[SAM3] Total missing keys: {len(missing_keys)}")
 
 
 def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
-    if device == "cuda":
+    if device == "cuda" and torch.cuda.is_available():
         model = model.cuda()
+    elif device != "cpu":
+        model = model.to(device)
     if eval_mode:
         model.eval()
     return model
@@ -560,6 +568,7 @@ def build_sam3_image_model(
     eval_mode=True,
     checkpoint_path=None,
     load_from_HF=True,
+    hf_token=None,
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
@@ -572,16 +581,19 @@ def build_sam3_image_model(
         device: Device to load the model on ('cuda' or 'cpu')
         eval_mode: Whether to set the model to evaluation mode
         checkpoint_path: Optional path to model checkpoint
+        load_from_HF: Whether to download from HuggingFace if checkpoint not found
+        hf_token: HuggingFace authentication token for gated models
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
-        compile_mode: To enable compilation, set to "default"
+        compile: Whether to enable torch compilation for speed
 
     Returns:
         A SAM3 image model
     """
     if bpe_path is None:
+        # Path to bundled BPE tokenizer vocabulary in sam3_lib/
         bpe_path = os.path.join(
-            os.path.dirname(__file__), "..", "assets", "bpe_simple_vocab_16e6.txt.gz"
+            os.path.dirname(__file__), "bpe_simple_vocab_16e6.txt.gz"
         )
     # Create visual components
     compile_mode = "default" if compile else None
@@ -611,8 +623,9 @@ def build_sam3_image_model(
     # Create geometry encoder
     input_geometry_encoder = _create_geometry_encoder()
     if enable_inst_interactivity:
-        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
-        inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
+        # Build the tracker base model for SAM2-style point/box segmentation
+        sam3_tracker_base = build_tracker(apply_temporal_disambiguation=False)
+        inst_predictor = SAM3InteractiveImagePredictor(sam3_tracker_base)
     else:
         inst_predictor = None
     # Create the SAM3 model
@@ -626,7 +639,7 @@ def build_sam3_image_model(
         eval_mode,
     )
     if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf()
+        checkpoint_path = download_ckpt_from_hf(hf_token=hf_token)
     # Load checkpoint if provided
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
@@ -637,12 +650,31 @@ def build_sam3_image_model(
     return model
 
 
-def download_ckpt_from_hf():
+def download_ckpt_from_hf(hf_token=None):
+    """
+    Download SAM3 checkpoint from HuggingFace
+
+    Args:
+        hf_token: Optional HuggingFace authentication token for gated models
+
+    Returns:
+        Path to downloaded checkpoint
+    """
     SAM3_MODEL_ID = "facebook/sam3"
     SAM3_CKPT_NAME = "sam3.pt"
     SAM3_CFG_NAME = "config.json"
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
+
+    # Download config and checkpoint with authentication if token provided
+    _ = hf_hub_download(
+        repo_id=SAM3_MODEL_ID,
+        filename=SAM3_CFG_NAME,
+        token=hf_token
+    )
+    checkpoint_path = hf_hub_download(
+        repo_id=SAM3_MODEL_ID,
+        filename=SAM3_CKPT_NAME,
+        token=hf_token
+    )
     return checkpoint_path
 
 
@@ -656,7 +688,9 @@ def build_sam3_video_model(
     apply_temporal_disambiguation: bool = True,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
-) -> Sam3VideoInferenceWithInstanceInteractivity:
+    hf_token: Optional[str] = None,
+    enable_inst_interactivity: bool = False,
+):
     """
     Build SAM3 dense tracking model.
 
@@ -668,15 +702,16 @@ def build_sam3_video_model(
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
     if bpe_path is None:
+        # Path to bundled BPE tokenizer vocabulary in sam3_lib/
         bpe_path = os.path.join(
-            os.path.dirname(__file__), "..", "assets", "bpe_simple_vocab_16e6.txt.gz"
+            os.path.dirname(__file__), "bpe_simple_vocab_16e6.txt.gz"
         )
 
     # Build Tracker module
     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
 
     # Build Detector components
-    visual_neck = _create_vision_backbone()
+    visual_neck = _create_vision_backbone(enable_inst_interactivity=enable_inst_interactivity)
     text_encoder = _create_text_encoder(bpe_path)
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
     transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
@@ -697,6 +732,13 @@ def build_sam3_video_model(
         d_model=256, d_proj=256, prompt_mlp=main_dot_prod_mlp
     )
 
+    # Build instance interactive predictor if enabled (for SAM2-style point/box segmentation)
+    if enable_inst_interactivity:
+        sam3_tracker_base = build_tracker(apply_temporal_disambiguation=False)
+        inst_predictor = SAM3InteractiveImagePredictor(sam3_tracker_base)
+    else:
+        inst_predictor = None
+
     # Build Detector module
     detector = Sam3ImageOnVideoMultiGPU(
         num_feature_levels=1,
@@ -709,6 +751,7 @@ def build_sam3_video_model(
         use_dot_prod_scoring=True,
         dot_prod_scoring=main_dot_prod_scoring,
         supervise_joint_box_scores=has_presence_token,
+        inst_interactive_predictor=inst_predictor,
     )
 
     # Build the main SAM3 video model
@@ -716,10 +759,10 @@ def build_sam3_video_model(
         model = Sam3VideoInferenceWithInstanceInteractivity(
             detector=detector,
             tracker=tracker,
-            score_threshold_detection=0.5,
+            score_threshold_detection=0.3,
             assoc_iou_thresh=0.1,
             det_nms_thresh=0.1,
-            new_det_thresh=0.7,
+            new_det_thresh=0.4,
             hotstart_delay=15,
             hotstart_unmatch_thresh=8,
             hotstart_dup_thresh=8,
@@ -743,10 +786,10 @@ def build_sam3_video_model(
         model = Sam3VideoInferenceWithInstanceInteractivity(
             detector=detector,
             tracker=tracker,
-            score_threshold_detection=0.5,
+            score_threshold_detection=0.3,
             assoc_iou_thresh=0.1,
             det_nms_thresh=0.1,
-            new_det_thresh=0.7,
+            new_det_thresh=0.4,
             hotstart_delay=0,
             hotstart_unmatch_thresh=0,
             hotstart_dup_thresh=0,
@@ -768,12 +811,23 @@ def build_sam3_video_model(
 
     # Load checkpoint if provided
     if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf()
+        checkpoint_path = download_ckpt_from_hf(hf_token=hf_token)
     if checkpoint_path is not None:
         with g_pathmgr.open(checkpoint_path, "rb") as f:
             ckpt = torch.load(f, map_location="cpu", weights_only=True)
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
+
+        # If inst_interactive_predictor is enabled, remap tracker weights for it
+        # The checkpoint has tracker.* keys, but detector.inst_interactive_predictor.model.* is expected
+        if enable_inst_interactivity and inst_predictor is not None:
+            inst_predictor_keys = {
+                k.replace("tracker.", "detector.inst_interactive_predictor.model."): v
+                for k, v in ckpt.items()
+                if k.startswith("tracker.")
+            }
+            ckpt.update(inst_predictor_keys)
+            print(f"[SAM3] Added {len(inst_predictor_keys)} keys for detector.inst_interactive_predictor")
 
         missing_keys, unexpected_keys = model.load_state_dict(
             ckpt, strict=strict_state_dict_loading
@@ -783,11 +837,15 @@ def build_sam3_video_model(
         if unexpected_keys:
             print(f"Unexpected keys: {unexpected_keys}")
 
+    # Keep model in float32; autocast will convert activations to bfloat16 dynamically
     model.to(device=device)
     return model
 
 
 def build_sam3_video_predictor(*model_args, gpus_to_use=None, **model_kwargs):
+    # Use single-device predictor on CPU, multi-GPU predictor only when CUDA is available
+    if not torch.cuda.is_available():
+        return Sam3VideoPredictor(*model_args, **model_kwargs)
     return Sam3VideoPredictorMultiGPU(
         *model_args, gpus_to_use=gpus_to_use, **model_kwargs
     )
